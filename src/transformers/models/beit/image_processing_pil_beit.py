@@ -160,7 +160,14 @@ class BeitImageProcessorPil(PilBackend):
         return processed_images
 
     @requires(backends=("torch",))
-    def post_process_semantic_segmentation(self, outputs, target_sizes: list[tuple] | None = None):
+    def post_process_semantic_segmentation(
+        self,
+        outputs,
+        target_sizes: list[tuple] | None = None,
+        decode_strategy: str = "argmax",
+        rankseg_metric: str = "dice",
+        rankseg_solver: str = "RMA",
+    ):
         """
         Converts the output of [`BeitForSemanticSegmentation`] into semantic segmentation maps.
 
@@ -180,6 +187,21 @@ class BeitImageProcessorPil(PilBackend):
         import torch.nn.functional as F
 
         logits = outputs.logits
+        if decode_strategy not in {"argmax", "rankseg"}:
+            raise ValueError("`decode_strategy` must be one of {'argmax', 'rankseg'}.")
+        if rankseg_metric not in {"dice", "iou"}:
+            raise ValueError("`rankseg_metric` must be either 'dice' or 'iou'.")
+        if rankseg_solver != "RMA":
+            raise ValueError("`rankseg_solver` must be 'RMA'.")
+        rankseg_decoder = None
+        if decode_strategy == "rankseg":
+            try:
+                from rankseg import RankSEG
+            except ImportError as error:
+                raise ImportError(
+                    "RankSEG is required when `decode_strategy='rankseg'`. Install it with `pip install rankseg`."
+                ) from error
+            rankseg_decoder = RankSEG(metric=rankseg_metric, solver=rankseg_solver, output_mode="multiclass")
 
         # Resize logits and compute semantic segmentation maps
         if target_sizes is not None:
@@ -197,10 +219,16 @@ class BeitImageProcessorPil(PilBackend):
                 resized_logits = F.interpolate(
                     logits[idx].unsqueeze(dim=0), size=target_sizes[idx], mode="bilinear", align_corners=False
                 )
-                semantic_map = resized_logits[0].argmax(dim=0)
+                if decode_strategy == "rankseg":
+                    semantic_map = rankseg_decoder.predict(resized_logits.softmax(dim=1))[0]
+                else:
+                    semantic_map = resized_logits[0].argmax(dim=0)
                 semantic_segmentation.append(semantic_map)
         else:
-            semantic_segmentation = logits.argmax(dim=1)
+            if decode_strategy == "rankseg":
+                semantic_segmentation = rankseg_decoder.predict(logits.softmax(dim=1))
+            else:
+                semantic_segmentation = logits.argmax(dim=1)
             semantic_segmentation = [semantic_segmentation[i] for i in range(semantic_segmentation.shape[0])]
 
         return semantic_segmentation

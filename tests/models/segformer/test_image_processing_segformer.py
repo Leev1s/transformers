@@ -14,6 +14,7 @@
 
 
 import unittest
+from types import SimpleNamespace
 
 from datasets import load_dataset
 
@@ -304,3 +305,40 @@ class SegformerImageProcessingTest(ImageProcessingTestMixin, unittest.TestCase):
                 atol=5,
                 mean_atol=0.01,
             )
+
+    def test_post_process_semantic_segmentation_decode_strategies(self):
+        try:
+            import rankseg  # noqa: F401
+        except ImportError:
+            self.skipTest("rankseg is not installed")
+
+        logits = torch.randn(2, 3, 12, 10)
+        outputs = SimpleNamespace(logits=logits)
+
+        for image_processing_class in self.image_processing_classes.values():
+            image_processing = image_processing_class(**self.image_processor_dict)
+
+            baseline = image_processing.post_process_semantic_segmentation(outputs=outputs)
+            argmax_with_strategy = image_processing.post_process_semantic_segmentation(
+                outputs=outputs, decode_strategy="argmax"
+            )
+            self.assertTrue(torch.equal(baseline[0], argmax_with_strategy[0]))
+
+            rankseg_output = image_processing.post_process_semantic_segmentation(
+                outputs=outputs,
+                decode_strategy="rankseg",
+                rankseg_metric="dice",
+                rankseg_solver="RMA",
+            )
+            self.assertEqual(rankseg_output[0].shape, baseline[0].shape)
+            self.assertEqual(rankseg_output[0].dtype, torch.int64)
+
+            with self.assertRaises(ValueError):
+                image_processing.post_process_semantic_segmentation(
+                    outputs=outputs, decode_strategy="rankseg", rankseg_metric="unsupported"
+                )
+
+            with self.assertRaises(ValueError):
+                image_processing.post_process_semantic_segmentation(
+                    outputs=outputs, decode_strategy="rankseg", rankseg_solver="not_rma"
+                )

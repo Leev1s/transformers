@@ -257,7 +257,14 @@ class DPTImageProcessor(TorchvisionBackend):
 
         return processed_images
 
-    def post_process_semantic_segmentation(self, outputs, target_sizes: list[tuple] | None = None):
+    def post_process_semantic_segmentation(
+        self,
+        outputs,
+        target_sizes: list[tuple] | None = None,
+        decode_strategy: str = "argmax",
+        rankseg_metric: str = "dice",
+        rankseg_solver: str = "RMA",
+    ):
         """
         Converts the output of [`DPTForSemanticSegmentation`] into semantic segmentation maps.
 
@@ -267,6 +274,13 @@ class DPTImageProcessor(TorchvisionBackend):
             target_sizes (`list[Tuple]` of length `batch_size`, *optional*):
                 List of tuples corresponding to the requested final size (height, width) of each prediction. If unset,
                 predictions will not be resized.
+            decode_strategy (`str`, *optional*, defaults to `"argmax"`):
+                Decoding strategy used to turn logits into segmentation maps. Use `"argmax"` to keep the default
+                behavior or `"rankseg"` to decode with RankSEG.
+            rankseg_metric (`str`, *optional*, defaults to `"dice"`):
+                Metric used by RankSEG when `decode_strategy="rankseg"`. Must be one of `"dice"` or `"iou"`.
+            rankseg_solver (`str`, *optional*, defaults to `"RMA"`):
+                RankSEG solver used when `decode_strategy="rankseg"`. Only `"RMA"` is supported.
 
         Returns:
             semantic_segmentation: `list[torch.Tensor]` of length `batch_size`, where each item is a semantic
@@ -277,6 +291,22 @@ class DPTImageProcessor(TorchvisionBackend):
             raise ImportError("PyTorch is required for post_process_semantic_segmentation")
 
         logits = outputs.logits
+        if decode_strategy not in {"argmax", "rankseg"}:
+            raise ValueError("`decode_strategy` must be one of {'argmax', 'rankseg'}.")
+        if rankseg_metric not in {"dice", "iou"}:
+            raise ValueError("`rankseg_metric` must be either 'dice' or 'iou'.")
+        if rankseg_solver != "RMA":
+            raise ValueError("`rankseg_solver` must be 'RMA'.")
+
+        rankseg_decoder = None
+        if decode_strategy == "rankseg":
+            try:
+                from rankseg import RankSEG
+            except ImportError as error:
+                raise ImportError(
+                    "RankSEG is required when `decode_strategy='rankseg'`. Install it with `pip install rankseg`."
+                ) from error
+            rankseg_decoder = RankSEG(metric=rankseg_metric, solver=rankseg_solver, output_mode="multiclass")
 
         # Resize logits and compute semantic segmentation maps
         if target_sizes is not None:
@@ -294,10 +324,16 @@ class DPTImageProcessor(TorchvisionBackend):
                 resized_logits = F.interpolate(
                     logits[idx].unsqueeze(dim=0), size=target_sizes[idx], mode="bilinear", align_corners=False
                 )
-                semantic_map = resized_logits[0].argmax(dim=0)
+                if decode_strategy == "rankseg":
+                    semantic_map = rankseg_decoder.predict(resized_logits.softmax(dim=1))[0]
+                else:
+                    semantic_map = resized_logits[0].argmax(dim=0)
                 semantic_segmentation.append(semantic_map)
         else:
-            semantic_segmentation = logits.argmax(dim=1)
+            if decode_strategy == "rankseg":
+                semantic_segmentation = rankseg_decoder.predict(logits.softmax(dim=1))
+            else:
+                semantic_segmentation = logits.argmax(dim=1)
             semantic_segmentation = [semantic_segmentation[i] for i in range(semantic_segmentation.shape[0])]
 
         return semantic_segmentation
