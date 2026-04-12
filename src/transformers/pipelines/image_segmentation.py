@@ -12,6 +12,9 @@ if is_vision_available():
     from ..image_utils import load_image
 
 if is_torch_available():
+    import torch
+    import torch.nn.functional as F
+
     from ..models.auto.modeling_auto import (
         MODEL_FOR_IMAGE_SEGMENTATION_MAPPING_NAMES,
         MODEL_FOR_INSTANCE_SEGMENTATION_MAPPING_NAMES,
@@ -78,9 +81,22 @@ class ImageSegmentationPipeline(Pipeline):
     def _sanitize_parameters(self, **kwargs):
         preprocess_kwargs = {}
         postprocess_kwargs = {}
+        semantic_postprocessing = kwargs.get("semantic_postprocessing")
+        if semantic_postprocessing is not None:
+            if semantic_postprocessing not in {"argmax", "rankseg"}:
+                raise ValueError(
+                    f"Invalid value for `semantic_postprocessing`: {semantic_postprocessing}. "
+                    "Valid values are 'argmax' and 'rankseg'."
+                )
+            postprocess_kwargs["semantic_postprocessing"] = semantic_postprocessing
+            if semantic_postprocessing == "rankseg" and "subtask" not in kwargs:
+                preprocess_kwargs["subtask"] = "semantic"
+                postprocess_kwargs["subtask"] = "semantic"
         if "subtask" in kwargs:
             postprocess_kwargs["subtask"] = kwargs["subtask"]
             preprocess_kwargs["subtask"] = kwargs["subtask"]
+        if "rankseg_kwargs" in kwargs:
+            postprocess_kwargs["rankseg_kwargs"] = kwargs["rankseg_kwargs"]
         if "threshold" in kwargs:
             postprocess_kwargs["threshold"] = kwargs["threshold"]
         if "mask_threshold" in kwargs:
@@ -124,6 +140,11 @@ class ImageSegmentationPipeline(Pipeline):
                 Threshold to use when turning the predicted masks into binary values.
             overlap_mask_area_threshold (`float`, *optional*, defaults to 0.5):
                 Mask overlap threshold to eliminate small, disconnected segments.
+            semantic_postprocessing (`str`, *optional*, defaults to `"argmax"`):
+                Semantic post-processing strategy. Choose between `"argmax"` and `"rankseg"`. RankSEG is only
+                supported for semantic segmentation.
+            rankseg_kwargs (`dict`, *optional*):
+                Keyword arguments forwarded to `rankseg.RankSEG(...)` when `semantic_postprocessing="rankseg"`.
             timeout (`float`, *optional*, defaults to None):
                 The maximum time in seconds to wait for fetching images from the web. If None, no timeout is set and
                 the call may block forever.
@@ -176,9 +197,118 @@ class ImageSegmentationPipeline(Pipeline):
         model_outputs["target_size"] = target_size
         return model_outputs
 
+    def _resize_semantic_logits(self, segmentation, target_sizes):
+        if target_sizes is None:
+            return [segmentation[i] for i in range(segmentation.shape[0])]
+
+        if isinstance(target_sizes, torch.Tensor):
+            target_sizes = target_sizes.tolist()
+
+        if segmentation.shape[0] != len(target_sizes):
+            raise ValueError("Make sure that you pass in as many target sizes as the batch dimension of the logits")
+
+        resized_logits = []
+        for idx, target_size in enumerate(target_sizes):
+            resized = F.interpolate(
+                segmentation[idx].unsqueeze(dim=0), size=target_size, mode="bilinear", align_corners=False
+            )[0]
+            resized_logits.append(resized)
+        return resized_logits
+
+    def _get_semantic_segmentation_logits(self, model_outputs):
+        target_sizes = model_outputs["target_size"]
+
+        if getattr(model_outputs, "logits", None) is not None and getattr(model_outputs, "pred_masks", None) is None:
+            return self._resize_semantic_logits(model_outputs.logits.float(), target_sizes)
+
+        if getattr(model_outputs, "semantic_seg", None) is not None:
+            return self._resize_semantic_logits(model_outputs.semantic_seg.float(), target_sizes)
+
+        class_queries_logits = getattr(model_outputs, "class_queries_logits", None)
+        masks_queries_logits = getattr(model_outputs, "masks_queries_logits", None)
+        if class_queries_logits is not None and masks_queries_logits is not None:
+            masks_queries_logits = masks_queries_logits.float()
+
+            if getattr(model_outputs, "patch_offsets", None) is not None:
+                size = self.image_processor.size
+                output_size = (size["shortest_edge"], size["longest_edge"] or size["shortest_edge"])
+                masks_queries_logits = F.interpolate(masks_queries_logits, size=output_size, mode="bilinear")
+
+            elif type(self.model.config).__name__ == "Mask2FormerConfig":
+                masks_queries_logits = F.interpolate(
+                    masks_queries_logits, size=(384, 384), mode="bilinear", align_corners=False
+                )
+
+            masks_classes = class_queries_logits.float().softmax(dim=-1)[..., :-1]
+            masks_probs = masks_queries_logits.sigmoid()
+            segmentation = torch.einsum("bqc, bqhw -> bchw", masks_classes, masks_probs)
+
+            if getattr(model_outputs, "patch_offsets", None) is not None:
+                size = self.image_processor.size
+                return self.image_processor.merge_image_patches(
+                    segmentation, model_outputs.patch_offsets, target_sizes, size
+                )
+
+            return self._resize_semantic_logits(segmentation, target_sizes)
+
+        class_queries_logits = getattr(model_outputs, "logits", None)
+        masks_queries_logits = getattr(model_outputs, "pred_masks", None)
+        if class_queries_logits is not None and masks_queries_logits is not None:
+            masks_classes = class_queries_logits.float().softmax(dim=-1)
+            if type(self.model.config).__name__ != "ConditionalDetrConfig":
+                masks_classes = masks_classes[..., :-1]
+            masks_probs = masks_queries_logits.float().sigmoid()
+            segmentation = torch.einsum("bqc, bqhw -> bchw", masks_classes, masks_probs)
+            return self._resize_semantic_logits(segmentation, target_sizes)
+
+        raise ValueError(f"RankSEG semantic post-processing is not supported for model {type(self.model)}")
+
+    def _postprocess_semantic_segmentation(self, model_outputs, semantic_postprocessing="argmax", rankseg_kwargs=None):
+        if semantic_postprocessing == "argmax":
+            return self.image_processor.post_process_semantic_segmentation(
+                model_outputs, target_sizes=model_outputs["target_size"]
+            )[0]
+
+        if rankseg_kwargs is None:
+            rankseg_kwargs = {}
+        elif not isinstance(rankseg_kwargs, dict):
+            raise ValueError("`rankseg_kwargs` must be a dictionary.")
+
+        try:
+            from rankseg import RankSEG
+        except ImportError as error:
+            raise ImportError(
+                "RankSEG semantic post-processing requires the `rankseg` package. "
+                "Install it with `uv pip install rankseg`."
+            ) from error
+
+        segmentation_logits = self._get_semantic_segmentation_logits(model_outputs)[0]
+        if getattr(model_outputs, "semantic_seg", None) is not None and segmentation_logits.shape[0] == 1:
+            probs = segmentation_logits.sigmoid().unsqueeze(0)
+            rankseg = RankSEG(**{**rankseg_kwargs, "output_mode": "multilabel"})
+            return rankseg.predict(probs)[0, 0].to(torch.long)
+
+        probs = segmentation_logits.softmax(dim=0).unsqueeze(0)
+        rankseg = RankSEG(**{**rankseg_kwargs, "output_mode": "multiclass"})
+        return rankseg.predict(probs)[0].to(torch.long)
+
     def postprocess(
-        self, model_outputs, subtask=None, threshold=0.9, mask_threshold=0.5, overlap_mask_area_threshold=0.5
+        self,
+        model_outputs,
+        subtask=None,
+        threshold=0.9,
+        mask_threshold=0.5,
+        overlap_mask_area_threshold=0.5,
+        semantic_postprocessing="argmax",
+        rankseg_kwargs=None,
     ):
+        if rankseg_kwargs is not None and semantic_postprocessing != "rankseg":
+            raise ValueError("`rankseg_kwargs` can only be used when `semantic_postprocessing='rankseg'`.")
+        if semantic_postprocessing == "rankseg":
+            if subtask not in {"semantic", None}:
+                raise ValueError("RankSEG semantic post-processing is only supported for `subtask='semantic'`.")
+            subtask = "semantic"
+
         fn = None
         if subtask in {"panoptic", None} and hasattr(self.image_processor, "post_process_panoptic_segmentation"):
             fn = self.image_processor.post_process_panoptic_segmentation
@@ -205,9 +335,11 @@ class ImageSegmentationPipeline(Pipeline):
                 annotation.append({"score": score, "label": label, "mask": mask})
 
         elif subtask in {"semantic", None} and hasattr(self.image_processor, "post_process_semantic_segmentation"):
-            outputs = self.image_processor.post_process_semantic_segmentation(
-                model_outputs, target_sizes=model_outputs["target_size"]
-            )[0]
+            outputs = self._postprocess_semantic_segmentation(
+                model_outputs,
+                semantic_postprocessing=semantic_postprocessing,
+                rankseg_kwargs=rankseg_kwargs,
+            )
 
             annotation = []
             segmentation = outputs.numpy()
