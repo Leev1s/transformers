@@ -197,32 +197,14 @@ class ImageSegmentationPipeline(Pipeline):
         model_outputs["target_size"] = target_size
         return model_outputs
 
-    def _resize_semantic_logits(self, segmentation, target_sizes):
-        if target_sizes is None:
-            return [segmentation[i] for i in range(segmentation.shape[0])]
-
-        if isinstance(target_sizes, torch.Tensor):
-            target_sizes = target_sizes.tolist()
-
-        if segmentation.shape[0] != len(target_sizes):
-            raise ValueError("Make sure that you pass in as many target sizes as the batch dimension of the logits")
-
-        resized_logits = []
-        for idx, target_size in enumerate(target_sizes):
-            resized = F.interpolate(
-                segmentation[idx].unsqueeze(dim=0), size=target_size, mode="bilinear", align_corners=False
-            )[0]
-            resized_logits.append(resized)
-        return resized_logits
-
     def _get_semantic_segmentation_logits(self, model_outputs):
-        target_sizes = model_outputs["target_size"]
-
         if getattr(model_outputs, "logits", None) is not None and getattr(model_outputs, "pred_masks", None) is None:
-            return self._resize_semantic_logits(model_outputs.logits.float(), target_sizes)
+            logits = model_outputs.logits.float()
+            return [logits[i] for i in range(logits.shape[0])]
 
         if getattr(model_outputs, "semantic_seg", None) is not None:
-            return self._resize_semantic_logits(model_outputs.semantic_seg.float(), target_sizes)
+            semantic_seg = model_outputs.semantic_seg.float()
+            return [semantic_seg[i] for i in range(semantic_seg.shape[0])]
 
         class_queries_logits = getattr(model_outputs, "class_queries_logits", None)
         masks_queries_logits = getattr(model_outputs, "masks_queries_logits", None)
@@ -246,10 +228,10 @@ class ImageSegmentationPipeline(Pipeline):
             if getattr(model_outputs, "patch_offsets", None) is not None:
                 size = self.image_processor.size
                 return self.image_processor.merge_image_patches(
-                    segmentation, model_outputs.patch_offsets, target_sizes, size
+                    segmentation, model_outputs.patch_offsets, model_outputs["target_size"], size
                 )
 
-            return self._resize_semantic_logits(segmentation, target_sizes)
+            return [segmentation[i] for i in range(segmentation.shape[0])]
 
         class_queries_logits = getattr(model_outputs, "logits", None)
         masks_queries_logits = getattr(model_outputs, "pred_masks", None)
@@ -259,7 +241,7 @@ class ImageSegmentationPipeline(Pipeline):
                 masks_classes = masks_classes[..., :-1]
             masks_probs = masks_queries_logits.float().sigmoid()
             segmentation = torch.einsum("bqc, bqhw -> bchw", masks_classes, masks_probs)
-            return self._resize_semantic_logits(segmentation, target_sizes)
+            return [segmentation[i] for i in range(segmentation.shape[0])]
 
         raise ValueError(f"RankSEG semantic post-processing is not supported for model {type(self.model)}")
 
@@ -282,15 +264,25 @@ class ImageSegmentationPipeline(Pipeline):
                 "Install it with `uv pip install rankseg`."
             ) from error
 
+        target_size = model_outputs["target_size"][0]
+        if isinstance(target_size, torch.Tensor):
+            target_size = target_size.tolist()
+
         segmentation_logits = self._get_semantic_segmentation_logits(model_outputs)[0]
         if getattr(model_outputs, "semantic_seg", None) is not None and segmentation_logits.shape[0] == 1:
             probs = segmentation_logits.sigmoid().unsqueeze(0)
             rankseg = RankSEG(**{**rankseg_kwargs, "output_mode": "multilabel"})
-            return rankseg.predict(probs)[0, 0].to(torch.long)
+            segmentation = rankseg.predict(probs)[0, 0].to(torch.long)
+        else:
+            probs = segmentation_logits.softmax(dim=0).unsqueeze(0)
+            rankseg = RankSEG(**{**rankseg_kwargs, "output_mode": "multiclass"})
+            segmentation = rankseg.predict(probs)[0].to(torch.long)
 
-        probs = segmentation_logits.softmax(dim=0).unsqueeze(0)
-        rankseg = RankSEG(**{**rankseg_kwargs, "output_mode": "multiclass"})
-        return rankseg.predict(probs)[0].to(torch.long)
+        if target_size is None:
+            return segmentation
+        return F.interpolate(segmentation[None, None, ...].float(), size=target_size, mode="nearest")[0, 0].to(
+            torch.long
+        )
 
     def postprocess(
         self,
