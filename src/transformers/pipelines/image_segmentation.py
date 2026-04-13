@@ -269,6 +269,11 @@ class ImageSegmentationPipeline(Pipeline):
             target_size = target_size.tolist()
 
         segmentation_logits = self._get_semantic_segmentation_logits(model_outputs)[0]
+        if target_size is not None:
+            segmentation_logits = F.interpolate(
+                segmentation_logits.unsqueeze(0), size=target_size, mode="bilinear", align_corners=False
+            )[0]
+
         if getattr(model_outputs, "semantic_seg", None) is not None and segmentation_logits.shape[0] == 1:
             probs = segmentation_logits.sigmoid().unsqueeze(0)
             rankseg = RankSEG(**{**rankseg_kwargs, "output_mode": "multilabel"})
@@ -278,11 +283,7 @@ class ImageSegmentationPipeline(Pipeline):
             rankseg = RankSEG(**{**rankseg_kwargs, "output_mode": "multiclass"})
             segmentation = rankseg.predict(probs)[0].to(torch.long)
 
-        if target_size is None:
-            return segmentation
-        return F.interpolate(segmentation[None, None, ...].float(), size=target_size, mode="nearest")[0, 0].to(
-            torch.long
-        )
+        return segmentation
 
     def postprocess(
         self,
